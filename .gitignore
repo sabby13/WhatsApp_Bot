@@ -1,0 +1,38 @@
+# --- Secrets & credentials (NEVER commit) ---
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+api_key.txt
+
+# --- WhatsApp session / OpenWA data (contains login credentials) ---
+data/
+sessions/
+session/
+media/
+openwa/          # if OpenWA is ever cloned inside this folder
+
+# --- Personal message database ---
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# --- Node (if any tooling) ---
+node_modules/
+
+# --- Logs & scratch ---
+*.log
+logs/
+.DS_Store
