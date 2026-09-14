@@ -17,10 +17,12 @@ logger = setup_logging(settings.log_level)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(
-        "STARTUP | webhook receiver up | ignore_groups=%s ignore_self=%s signature=%s",
+        "STARTUP | webhook receiver up | ignore_groups=%s ignore_self=%s signature=%s | ai_provider=%s model=%s",
         settings.ignore_groups,
         settings.ignore_self,
         "on" if settings.openwa_webhook_secret else "off",
+        settings.ai_provider,
+        settings.groq_model,
     )
     yield
     logger.info("SHUTDOWN | webhook receiver stopped")

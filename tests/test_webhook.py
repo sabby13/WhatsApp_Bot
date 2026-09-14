@@ -145,3 +145,51 @@ def test_signature_enforced(monkeypatch):
     ok = client.post("/webhooks/openwa", content=raw,
                      headers={"content-type": "application/json", "X-Webhook-Signature": sig})
     assert ok.status_code == 200 and ok.json()["status"] == "received"
+
+
+# --------------------------------------------------------------------------------------
+# Milestone 3 — AI (Groq) integration, log-only. `ai` is the autouse FakeProvider fixture.
+# --------------------------------------------------------------------------------------
+
+def test_valid_message_calls_groq_once(ai):
+    r = client.post("/webhooks/openwa", json=_wwebjs_v0234(**{"id": "false_m3_valid", "body": "what you doing"}))
+    body = r.json()
+    assert r.status_code == 200 and body["status"] == "received"
+    assert body["reply_generated"] is True
+    assert ai.calls == 1
+
+
+def test_ignored_message_never_calls_groq(ai):
+    # from self
+    client.post("/webhooks/openwa", json=_wwebjs_v0234(**{"id": "true_m3_self", "fromMe": True}))
+    # group
+    client.post("/webhooks/openwa", json=_wwebjs_v0234(
+        **{"id": "false_m3_grp", "chatId": "1-2@g.us", "from": "1-2@g.us", "isGroup": True, "kind": "group"}))
+    # status
+    client.post("/webhooks/openwa", json=_wwebjs_v0234(
+        **{"id": "false_m3_status", "chatId": "status@broadcast", "kind": "status", "isStatusBroadcast": True}))
+    assert ai.calls == 0
+
+
+def test_duplicate_never_calls_groq_again(ai):
+    p = _wwebjs_v0234(**{"id": "false_m3_dupe", "body": "hi"})
+    client.post("/webhooks/openwa", json=p)
+    client.post("/webhooks/openwa", json=p)
+    assert ai.calls == 1  # second is deduped before the provider is reached
+
+
+def test_groq_failure_keeps_webhook_stable(ai):
+    from app.ai.base import AIError
+    ai.error = AIError("groq", "boom")
+    r = client.post("/webhooks/openwa", json=_wwebjs_v0234(**{"id": "false_m3_fail", "body": "hi"}))
+    assert r.status_code == 200
+    assert r.json()["status"] == "received" and r.json()["reply_generated"] is False
+    assert ai.calls == 1
+
+
+def test_empty_model_response_handled(ai):
+    ai.reply = ""
+    r = client.post("/webhooks/openwa", json=_wwebjs_v0234(**{"id": "false_m3_empty", "body": "hi"}))
+    assert r.status_code == 200
+    assert r.json()["status"] == "received" and r.json()["reply_generated"] is False
+    assert ai.calls == 1
