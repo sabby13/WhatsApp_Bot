@@ -1,8 +1,11 @@
 """Milestone 2 verification tests.
 
 Run from the project root:  python -m pytest -q
-These exercise the webhook receiver with sample payloads for BOTH engine shapes
-(whatsapp-web.js style and Baileys style) and confirm the safeguards.
+
+The main payloads below mirror the REAL OpenWA v0.23.4 `message.received` shape
+(engine-neutral IncomingMessage), including a LID sender like the one observed in
+the live test (16608722419787@lid, id "false_..."). A Baileys-shaped payload is
+also covered so the parser survives an engine switch.
 """
 import hashlib
 import hmac
@@ -15,27 +18,50 @@ from app.main import app
 client = TestClient(app)
 
 
+def _wwebjs_v0234(**over):
+    """A realistic v0.23.4 message.received payload; override any field via kwargs."""
+    data = {
+        "id": "false_16608722419787@lid_3EB0ABCDEF12",
+        "from": "16608722419787@lid",
+        "to": "919812345678@c.us",
+        "chatId": "16608722419787@lid",
+        "body": "Hello",
+        "type": "text",
+        "timestamp": 1757800000,
+        "fromMe": False,
+        "isGroup": False,
+        "kind": "individual",
+        "isStatusBroadcast": False,
+        "isLidSender": True,
+        "contact": {"pushName": "Test Sender"},
+    }
+    data.update(over)
+    return {"event": "message.received", "sessionId": "whatsapp-bot", "data": data}
+
+
 def test_health():
     r = client.get("/health")
     assert r.status_code == 200 and r.json()["status"] == "ok"
 
 
-def test_incoming_wwebjs_shape():
-    payload = {
-        "event": "message.received",
-        "sessionId": "whatsapp-bot",
-        "data": {
-            "id": "true_9199xxxx@c.us_ABC123",
-            "from": "9199xxxx@c.us",
-            "body": "Khaana kha liya?",
-            "type": "text",
-            "timestamp": 1719312000,
-            "fromMe": False,
-            "isGroup": False,
-        },
-    }
-    r = client.post("/webhooks/openwa", json=payload)
-    assert r.status_code == 200 and r.json()["status"] == "received"
+def test_incoming_lid_v0234():
+    """Real shape: LID sender is accepted, JID kept verbatim, id preserved, LID flagged."""
+    r = client.post("/webhooks/openwa", json=_wwebjs_v0234())
+    body = r.json()
+    assert r.status_code == 200 and body["status"] == "received"
+    assert body["sender"] == "16608722419787@lid"      # not rewritten to @c.us
+    assert body["is_lid"] is True
+    assert body["id"] == "false_16608722419787@lid_3EB0ABCDEF12"  # false_ prefix is correct
+
+
+def test_incoming_phone_user():
+    r = client.post("/webhooks/openwa", json=_wwebjs_v0234(
+        **{"id": "false_919812345678@c.us_XYZ", "from": "919812345678@c.us",
+           "chatId": "919812345678@c.us", "isLidSender": False, "body": "hi"}
+    ))
+    body = r.json()
+    assert body["status"] == "received" and body["is_lid"] is False
+    assert body["sender"] == "919812345678@c.us"
 
 
 def test_incoming_baileys_shape():
@@ -51,22 +77,35 @@ def test_incoming_baileys_shape():
     assert r.status_code == 200 and r.json()["status"] == "received"
 
 
-def test_ignore_from_me():
-    payload = {"event": "message.received", "data": {"id": "m1", "from": "x@c.us", "body": "hi", "fromMe": True}}
-    r = client.post("/webhooks/openwa", json=payload)
-    assert r.json()["reason"] == "from_me"
-
-
-def test_ignore_group():
-    payload = {"event": "message.received", "data": {"id": "m2", "from": "12345-678@g.us", "body": "hi"}}
-    r = client.post("/webhooks/openwa", json=payload)
+def test_group_via_author_and_kind():
+    """Group message: real sender is `author`; ignored by the group safeguard (kind=group)."""
+    r = client.post("/webhooks/openwa", json=_wwebjs_v0234(
+        **{"chatId": "12345-678@g.us", "from": "12345-678@g.us",
+           "author": "919812345678@c.us", "isGroup": True, "kind": "group",
+           "id": "false_12345-678@g.us_GRP"}
+    ))
     assert r.json()["reason"] == "group"
 
 
-def test_ignore_status():
-    payload = {"event": "message.received", "data": {"id": "m3", "from": "status@broadcast", "body": "story"}}
-    r = client.post("/webhooks/openwa", json=payload)
+def test_ignore_from_me():
+    r = client.post("/webhooks/openwa", json=_wwebjs_v0234(**{"fromMe": True, "id": "true_x_1"}))
+    assert r.json()["reason"] == "from_me"
+
+
+def test_ignore_status_via_flag():
+    r = client.post("/webhooks/openwa", json=_wwebjs_v0234(
+        **{"chatId": "status@broadcast", "from": "status@broadcast",
+           "kind": "status", "isStatusBroadcast": True, "id": "false_status_1"}
+    ))
     assert r.json()["reason"] == "status"
+
+
+def test_ignore_channel():
+    r = client.post("/webhooks/openwa", json=_wwebjs_v0234(
+        **{"chatId": "12036@newsletter", "from": "12036@newsletter",
+           "kind": "channel", "id": "false_ch_1"}
+    ))
+    assert r.json()["reason"] == "channel"
 
 
 def test_ignore_non_message_event():
@@ -75,20 +114,27 @@ def test_ignore_non_message_event():
     assert r.json()["reason"] == "event"
 
 
-def test_dedupe():
-    payload = {"event": "message.received", "data": {"id": "dup-1", "from": "x@c.us", "body": "hi"}}
-    first = client.post("/webhooks/openwa", json=payload)
-    second = client.post("/webhooks/openwa", json=payload)
+def test_dedupe_real_id():
+    p = _wwebjs_v0234(**{"id": "false_16608722419787@lid_DUP"})
+    first = client.post("/webhooks/openwa", json=p)
+    second = client.post("/webhooks/openwa", json=p)
     assert first.json()["status"] == "received"
     assert second.json()["reason"] == "duplicate"
+
+
+def test_empty_id_not_deduped():
+    """Two distinct messages with the unreadable-id sentinel ('') are both processed."""
+    a = client.post("/webhooks/openwa", json=_wwebjs_v0234(**{"id": "", "body": "one"}))
+    b = client.post("/webhooks/openwa", json=_wwebjs_v0234(**{"id": "", "body": "two"}))
+    assert a.json()["status"] == "received"
+    assert b.json()["status"] == "received"
 
 
 def test_signature_enforced(monkeypatch):
     from app import webhooks
 
     monkeypatch.setattr(webhooks.settings, "openwa_webhook_secret", "s3cret")
-    body = {"event": "message.received", "data": {"id": "sig-1", "from": "x@c.us", "body": "hi"}}
-    raw = json.dumps(body).encode()
+    raw = json.dumps(_wwebjs_v0234(**{"id": "false_sig_1"})).encode()
 
     # No signature -> rejected
     assert client.post("/webhooks/openwa", content=raw,

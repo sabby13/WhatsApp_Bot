@@ -1,0 +1,10 @@
+# OpenWA local dev config (read automatically by docker compose in this folder).
+# Added to let the local FastAPI webhook receiver be reachable (WhatsApp Bot Milestone 2).
+#
+# OpenWA's SSRF guard (src/common/security/ssrf-guard.ts) blocks webhook destinations
+# that resolve to private/reserved IP ranges. host.docker.internal is the Docker Desktop
+# host gateway (a private address), so it must be allow-listed. It is matched
+# case-insensitively against the URL hostname, so the hostname alone is enough.
+#
+# This does NOT disable SSRF protection: WEBHOOK_SSRF_PROTECT stays on (default).
+SSRF_ALLOWED_HOSTS=localhost,host.docker.internal
