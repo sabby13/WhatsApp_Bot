@@ -39,11 +39,17 @@ from fastapi import APIRouter, Header, HTTPException, Request
 
 from .ai import factory
 from .ai.base import AIError
+from . import openwa_client as owa
+from .openwa_client import OpenWASendError
 from .config import settings
 from .logging_setup import setup_logging
+from .rate_limit import RateLimiter
 
 logger = setup_logging(settings.log_level)
 router = APIRouter()
+
+# Per-contact, in-memory rate limiter (no Redis/DB). Module-level so it persists across requests.
+_rate_limiter = RateLimiter()
 
 # In-memory dedupe of recently seen message ids. Bounded; oldest auto-evicted.
 # (A durable, DB-backed version comes in a later milestone.)
@@ -195,33 +201,71 @@ async def openwa_webhook(
         text,
     )
 
-    # --- Milestone 3: generate a reply with the AI provider (LOG ONLY — nothing is sent) ---
-    # Only runs AFTER every safeguard above has passed, so ignored/duplicate messages never
-    # reach the provider. Any failure is caught: the webhook still returns 200 so OpenWA does
-    # not retry and create duplicate events.
-    reply_generated = False
-    if text and text.strip():
-        try:
-            provider = factory.get_ai_provider()
-            reply = await provider.generate_reply(text)
-        except AIError as e:
-            logger.warning("AI_ERROR | sender=%s | id=%s | %s", sender_str, msg_id, e.safe_message())
-        except Exception as e:  # defensive: AI must never crash the receiver
-            logger.warning("AI_ERROR | sender=%s | id=%s | unexpected: %s", sender_str, msg_id, type(e).__name__)
-        else:
-            if reply:
-                reply_generated = True
-                logger.info("GENERATED | sender=%s | reply=%r", sender_str, reply)
-            else:
-                logger.warning("AI_ERROR | sender=%s | id=%s | empty response from provider", sender_str, msg_id)
-    else:
-        logger.info("SKIPPED  | empty message body | id=%s", msg_id)
-
-    return {
+    # Base result for any message that passed the safeguards. HTTP is always 200 so OpenWA
+    # acknowledges the event and does not retry (no retry/loop storms).
+    result = {
         "status": "received",
         "chat": chat_str,
         "sender": sender_str,
         "is_lid": is_lid,
         "id": msg_id,
-        "reply_generated": reply_generated,
+        "reply_generated": False,
+        "sent": False,
+        "message_id": None,
     }
+
+    # --- Milestone 4: kill switch -> whitelist -> rate limit -> Groq -> send (LOG each step) ---
+
+    # 1) Global kill switch. Nothing bypasses this. Reception/logging above still happened.
+    if not settings.bot_enabled:
+        logger.info("IGNORED | bot_disabled | id=%s", msg_id)
+        return {**result, "status": "ignored", "reason": "bot_disabled"}
+
+    # 2) Whitelist. Only explicitly whitelisted senders may trigger Groq or a send. An empty
+    #    whitelist means nobody is allowed. Matches @lid or @c.us; no phone inference from a LID.
+    allowed = settings.whitelist
+    if sender_str.lower() not in allowed and chat_str.lower() not in allowed:
+        logger.info("IGNORED | not_whitelisted | sender=%s | id=%s", sender_str, msg_id)
+        return {**result, "status": "ignored", "reason": "not_whitelisted"}
+
+    # 3) Nothing to reply to.
+    if not text.strip():
+        logger.info("SKIPPED  | empty message body | id=%s", msg_id)
+        return {**result, "status": "ignored", "reason": "empty"}
+
+    # 4) Per-contact rate limit (checked before Groq so a flood costs no API calls).
+    if not _rate_limiter.allow(chat_str, settings.max_auto_replies_per_minute):
+        logger.info("IGNORED | rate_limited | sender=%s | id=%s", sender_str, msg_id)
+        return {**result, "status": "ignored", "reason": "rate_limited"}
+
+    # 5) Generate the reply. On ANY failure: do not send, stay stable, return 200.
+    try:
+        provider = factory.get_ai_provider()
+        reply = await provider.generate_reply(text)
+    except AIError as e:
+        logger.warning("AI_ERROR | sender=%s | id=%s | %s", sender_str, msg_id, e.safe_message())
+        return {**result, "reason": "ai_error"}
+    except Exception as e:  # defensive: AI must never crash the receiver
+        logger.warning("AI_ERROR | sender=%s | id=%s | unexpected: %s", sender_str, msg_id, type(e).__name__)
+        return {**result, "reason": "ai_error"}
+
+    if not reply:
+        logger.warning("AI_ERROR | sender=%s | id=%s | empty response from provider", sender_str, msg_id)
+        return {**result, "reason": "ai_empty"}
+
+    result["reply_generated"] = True
+    logger.info("GENERATED | sender=%s | reply=%r", sender_str, reply)
+
+    # 6) Send via OpenWA to the CANONICAL chat id (the @lid for a LID sender — never a rebuilt phone).
+    #    On failure: log clearly, do NOT regenerate or retry, still return 200.
+    try:
+        message_id = await owa.get_openwa_client().send_text(chat_str, reply)
+    except OpenWASendError as e:
+        logger.warning("SEND_ERROR | recipient=%s | id=%s | %s", chat_str, msg_id, e.safe_message())
+        return {**result, "reason": "send_error"}
+    except Exception as e:  # defensive: a send failure must never crash the receiver
+        logger.warning("SEND_ERROR | recipient=%s | id=%s | unexpected: %s", chat_str, msg_id, type(e).__name__)
+        return {**result, "reason": "send_error"}
+
+    logger.info("SENT     | recipient=%s | message_id=%s", chat_str, message_id or "-")
+    return {**result, "sent": True, "message_id": message_id or None}

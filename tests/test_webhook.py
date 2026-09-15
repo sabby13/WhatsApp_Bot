@@ -193,3 +193,86 @@ def test_empty_model_response_handled(ai):
     assert r.status_code == 200
     assert r.json()["status"] == "received" and r.json()["reply_generated"] is False
     assert ai.calls == 1
+
+
+# --------------------------------------------------------------------------------------
+# Milestone 4 — controlled outbound sending. `ai`/`owa`/`env` are autouse fixtures.
+# --------------------------------------------------------------------------------------
+
+def test_kill_switch_off_no_ai_no_send(ai, owa, monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, "bot_enabled", False)
+    r = client.post("/webhooks/openwa", json=_wwebjs_v0234(**{"id": "false_m4_off"}))
+    assert r.status_code == 200 and r.json()["reason"] == "bot_disabled"
+    assert ai.calls == 0 and owa.sends == []
+
+
+def test_whitelisted_sender_ai_once_send_once(ai, owa):
+    r = client.post("/webhooks/openwa", json=_wwebjs_v0234(**{"id": "false_m4_ok", "body": "hey bot test"}))
+    body = r.json()
+    assert body["status"] == "received" and body["sent"] is True and body["message_id"] == "wamid.TEST123"
+    assert ai.calls == 1
+    assert len(owa.sends) == 1
+
+
+def test_non_whitelisted_no_ai_no_send(ai, owa):
+    r = client.post("/webhooks/openwa", json=_wwebjs_v0234(
+        **{"id": "false_m4_nowl", "from": "999999@c.us", "chatId": "999999@c.us", "isLidSender": False}))
+    assert r.json()["reason"] == "not_whitelisted"
+    assert ai.calls == 0 and owa.sends == []
+
+
+def test_self_message_no_ai_no_send(ai, owa):
+    client.post("/webhooks/openwa", json=_wwebjs_v0234(**{"id": "true_m4_self", "fromMe": True}))
+    assert ai.calls == 0 and owa.sends == []
+
+
+def test_group_no_ai_no_send(ai, owa):
+    client.post("/webhooks/openwa", json=_wwebjs_v0234(
+        **{"id": "false_m4_grp", "chatId": "1-2@g.us", "from": "1-2@g.us", "isGroup": True, "kind": "group"}))
+    assert ai.calls == 0 and owa.sends == []
+
+
+def test_duplicate_no_second_ai_or_send(ai, owa):
+    p = _wwebjs_v0234(**{"id": "false_m4_dupe", "body": "hi"})
+    client.post("/webhooks/openwa", json=p)
+    client.post("/webhooks/openwa", json=p)
+    assert ai.calls == 1 and len(owa.sends) == 1
+
+
+def test_rate_limit_blocks(ai, owa, monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, "max_auto_replies_per_minute", 1)
+    a = client.post("/webhooks/openwa", json=_wwebjs_v0234(**{"id": "false_m4_rl_1", "body": "one"}))
+    b = client.post("/webhooks/openwa", json=_wwebjs_v0234(**{"id": "false_m4_rl_2", "body": "two"}))
+    assert a.json()["sent"] is True
+    assert b.json()["reason"] == "rate_limited"
+    assert ai.calls == 1 and len(owa.sends) == 1   # second never reached Groq or send
+
+
+def test_groq_failure_no_send(ai, owa):
+    from app.ai.base import AIError
+    ai.error = AIError("groq", "boom")
+    r = client.post("/webhooks/openwa", json=_wwebjs_v0234(**{"id": "false_m4_aifail", "body": "hi"}))
+    assert r.status_code == 200 and r.json()["reason"] == "ai_error"
+    assert r.json()["sent"] is False
+    assert ai.calls == 1 and owa.sends == []   # nothing sent
+
+
+def test_openwa_failure_handled_no_retry_loop(ai, owa):
+    from app.openwa_client import OpenWASendError
+    owa.error = OpenWASendError("http 500: server error")
+    r = client.post("/webhooks/openwa", json=_wwebjs_v0234(**{"id": "false_m4_sendfail", "body": "hi"}))
+    assert r.status_code == 200 and r.json()["reason"] == "send_error"
+    assert r.json()["reply_generated"] is True and r.json()["sent"] is False
+    assert ai.calls == 1   # generated once, no regenerate loop
+
+
+def test_lid_reply_targets_canonical_identity(ai, owa):
+    """Reply must go to the incoming @lid chatId, never a reconstructed phone."""
+    client.post("/webhooks/openwa", json=_wwebjs_v0234(
+        **{"id": "false_m4_lid", "from": "16608722419787@lid", "chatId": "16608722419787@lid",
+           "isLidSender": True, "body": "hey"}))
+    assert len(owa.sends) == 1
+    recipient, _text = owa.sends[0]
+    assert recipient == "16608722419787@lid"
