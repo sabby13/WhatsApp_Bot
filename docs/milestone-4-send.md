@@ -66,12 +66,24 @@ docker exec openwa-api cat /app/data/.api-key
 Paste it into `.env` as `OPENWA_API_KEY=` **only**. It is gitignored and the app never logs it (startup
 shows only `openwa_key=set`).
 
-## 3. `.env` variables to add
+## 3. Get the session UUID (NOT the name)
+
+The send endpoint `POST /api/sessions/:sessionId/messages/send-text` keys the running engine by the
+session's **UUID primary key**, not the display name. Passing the name `whatsapp-bot` fails with
+`400 Session 'whatsapp-bot' is not active`. Get the UUID either way:
+
+```powershell
+# from the API (find the object whose "name" is whatsapp-bot, copy its "id"):
+curl.exe -s http://localhost:2785/api/sessions -H "X-API-Key: <your key>"
+# or: copy the "Session ID" shown for whatsapp-bot in the OpenWA dashboard.
+```
+
+## 4. `.env` variables to add
 
 ```
 OPENWA_API_KEY=<the owa_k1_... key from step 2>
 OPENWA_BASE_URL=http://localhost:2785
-OPENWA_SESSION=whatsapp-bot
+OPENWA_SESSION=<the session UUID from step 3, e.g. 3f9c1e2a-....>   # NOT "whatsapp-bot"
 MAX_AUTO_REPLIES_PER_MINUTE=5
 
 # LEAVE THESE OFF for now — you will flip them on manually for the test:
@@ -79,7 +91,8 @@ BOT_ENABLED=false
 WHITELISTED_CONTACTS=
 ```
 
-(Groq vars from Milestone 3 stay as they are.)
+(Groq vars from Milestone 3 stay as they are. If you ever delete & recreate the session, its UUID
+changes — update `OPENWA_SESSION` again.)
 
 ## 4. Run the tests (never touches real Groq or WhatsApp)
 
@@ -123,8 +136,11 @@ To stop all sending instantly at any time: set `BOT_ENABLED=false` and restart.
 
 ## Troubleshooting
 
+- `SEND_ERROR | ... http 400: Session '...' is not active. Start the session first.` → `OPENWA_SESSION`
+  holds the session **name** instead of its **UUID**. The engine registry is keyed by the session UUID, so
+  put the UUID (step 3) in `OPENWA_SESSION`. The session is fine; do not stop/recreate it.
 - `SEND_ERROR | ... http 401` → wrong/missing `OPENWA_API_KEY`. Re-read it (step 2), update `.env`, restart.
-- `SEND_ERROR | ... http 404` → wrong `OPENWA_SESSION`; it must match your session (`whatsapp-bot`).
+- `SEND_ERROR | ... http 404` → check `OPENWA_BASE_URL` and that OpenWA is running on :2785.
 - Reply generated but not delivered, `RecipientUnreachable`-style error → the contact could not be resolved;
   confirm you whitelisted the exact `@lid` from the `RECEIVED` log.
 - Nothing happens on a whitelisted message → check the line after `RECEIVED`: `bot_disabled` (flip
